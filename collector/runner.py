@@ -1,22 +1,10 @@
-"""
-The collector thread.
-
-Shape of the loop, in plain terms:
-  every 30s  - ask Kalshi which market is currently open in each series
-  every  5s  - fetch that market's order book and drop the snapshot in a bucket
-  when the clock ticks over to a new minute - empty the bucket into one
-               database row, then start a fresh bucket
-
-The bucket is why we poll 12 times but only write once. Raw 5-second rows
-would be ~86,000 a day and would eat the Supabase free tier in weeks.
-
-Read only. This thread never places, cancels, or modifies an order.
-"""
+"""Minute rows always. Full book on minutes 14 and 3. 5s touch samples at open."""
 
 import logging
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from decimal import Decimal
 
 from .config import (
     DISCOVERY_SECONDS,
@@ -25,9 +13,19 @@ from .config import (
     POLL_SECONDS,
 )
 from .kalshi import Kalshi, parse_book
-from .store import insert_minute, make_engine
+from .store import (
+    insert_minute,
+    insert_sample,
+    make_engine,
+    pending_settlement,
+    upsert_settlement,
+)
 
 log = logging.getLogger("collector")
+
+BOOK_MINUTES = {14, 3}
+SAMPLE_MIN_LEFT = 14
+SETTLE_EVERY = 1800
 
 
 def _minute_floor(dt):
@@ -43,9 +41,16 @@ def _parse_close(value):
         return None
 
 
-class Bucket:
-    """One minute's worth of snapshots for one market."""
+def _num(value):
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
 
+
+class Bucket:
     def __init__(self, series, ticker, minute_ts, close_time):
         self.series = series
         self.ticker = ticker
@@ -56,23 +61,24 @@ class Bucket:
     def add(self, snap):
         self.samples.append(snap)
 
+    def minutes_left(self):
+        if not self.close_time:
+            return None
+        return int((self.close_time - self.minute_ts).total_seconds() // 60)
+
     def to_row(self):
         if not self.samples:
             return None
         first, last = self.samples[0], self.samples[-1]
         spreads = [s["spread"] for s in self.samples if s["spread"] is not None]
-
-        minutes_left = None
-        if self.close_time:
-            delta = (self.close_time - self.minute_ts).total_seconds()
-            minutes_left = int(delta // 60)
-
+        ml = self.minutes_left()
+        keep_book = ml in BOOK_MINUTES
         n = len(self.samples)
         return {
             "series": self.series,
             "ticker": self.ticker,
             "minute_ts": self.minute_ts,
-            "minutes_left": minutes_left,
+            "minutes_left": ml,
             "yes_bid": last["yes_bid"],
             "yes_bid_size": last["yes_bid_size"],
             "no_bid": last["no_bid"],
@@ -90,6 +96,10 @@ class Bucket:
             "no_bid_last": last["no_bid"],
             "samples": n,
             "gap_flag": n < GAP_THRESHOLD,
+            "yes_book": last.get("yes_book") if keep_book else None,
+            "no_book": last.get("no_book") if keep_book else None,
+            "book_sample_ts": last.get("ts") if keep_book else None,
+            "book_truncated": last.get("book_truncated") if keep_book else None,
         }
 
 
@@ -98,24 +108,20 @@ class Collector:
         self.cfg = cfg
         self.kalshi = Kalshi(cfg.kalshi_key_id, cfg.kalshi_private_key)
         self.engine = make_engine(cfg.database_url)
-
         self._lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
-
-        # dashboard state
         self.started_at = None
         self.last_poll_at = None
         self.last_write_at = None
         self.last_error = None
         self.rows_written = 0
         self.poll_errors = 0
-        self.active = {}          # series -> ticker
-        self._buckets = {}        # ticker -> Bucket
-        self._close_times = {}    # ticker -> datetime
+        self.active = {}
+        self._buckets = {}
+        self._close_times = {}
         self._last_discovery = 0.0
-
-    # ---- lifecycle -----------------------------------------------------
+        self._last_settle = 0.0
 
     def start(self):
         with self._lock:
@@ -129,8 +135,6 @@ class Collector:
     def alive(self):
         return bool(self._thread and self._thread.is_alive())
 
-    # ---- work ----------------------------------------------------------
-
     def _discover(self):
         for series in self.cfg.series:
             try:
@@ -138,16 +142,13 @@ class Collector:
             except Exception as exc:
                 self.last_error = f"discover {series}: {exc}"
                 continue
-
             best, best_close = None, None
             for m in markets:
                 close = _parse_close(m.get("close_time"))
                 if close is None:
                     continue
-                # the soonest-closing open market is the live window
                 if best_close is None or close < best_close:
                     best, best_close = m.get("ticker"), close
-
             if best:
                 self.active[series] = best
                 self._close_times[best] = best_close
@@ -184,23 +185,100 @@ class Collector:
                 continue
             if snap is None:
                 continue
+            snap["ts"] = now
+            close_dt = self._close_times.get(ticker)
+            ml = None
+            if close_dt is not None:
+                ml = int((close_dt - minute).total_seconds() // 60)
 
             bucket = self._buckets.get(ticker)
             if bucket is None:
-                bucket = Bucket(series, ticker, minute, self._close_times.get(ticker))
+                bucket = Bucket(series, ticker, minute, close_dt)
                 self._buckets[ticker] = bucket
             elif bucket.minute_ts != minute:
                 self._flush(ticker)
-                bucket = Bucket(series, ticker, minute, self._close_times.get(ticker))
+                bucket = Bucket(series, ticker, minute, close_dt)
                 self._buckets[ticker] = bucket
-
             bucket.add(snap)
 
-        # a market that rolled over or closed still owes us its last minute
+            if ml is not None and ml >= SAMPLE_MIN_LEFT:
+                try:
+                    insert_sample(
+                        self.engine,
+                        {
+                            "series": series,
+                            "ticker": ticker,
+                            "sample_ts": now,
+                            "minutes_left": ml,
+                            "yes_bid": snap["yes_bid"],
+                            "yes_bid_size": snap["yes_bid_size"],
+                            "no_bid": snap["no_bid"],
+                            "no_bid_size": snap["no_bid_size"],
+                            "yes_depth_total": snap["yes_depth_total"],
+                            "no_depth_total": snap["no_depth_total"],
+                            "yes_levels": snap["yes_levels"],
+                            "no_levels": snap["no_levels"],
+                            "spread": snap["spread"],
+                        },
+                    )
+                except Exception as exc:
+                    self.last_error = f"sample {ticker}: {exc}"
+
         for ticker in [t for t in self._buckets if t not in live]:
             self._flush(ticker)
-
         self.last_poll_at = now
+
+    def _sweep_settlement(self):
+        try:
+            rows = pending_settlement(self.engine)
+        except Exception as exc:
+            self.last_error = f"settle list: {exc}"
+            return
+        for row in rows:
+            ticker = row["ticker"]
+            series = row["series"]
+            try:
+                m = self.kalshi.market(ticker) or {}
+            except Exception as exc:
+                self.last_error = f"settle {ticker}: {exc}"
+                try:
+                    upsert_settlement(
+                        self.engine,
+                        {
+                            "ticker": ticker,
+                            "series": series,
+                            "close_time": None,
+                            "result": None,
+                            "expiration_value": None,
+                            "floor_strike": None,
+                            "volume_fp": None,
+                            "attempts": 1,
+                        },
+                    )
+                except Exception:
+                    pass
+                continue
+            result = (m.get("result") or "").strip().lower() or None
+            if result not in ("yes", "no"):
+                result = None
+            attempts_bump = 0 if result else 1
+            try:
+                upsert_settlement(
+                    self.engine,
+                    {
+                        "ticker": ticker,
+                        "series": series,
+                        "close_time": _parse_close(m.get("close_time")),
+                        "result": result,
+                        "expiration_value": _num(m.get("expiration_value")),
+                        "floor_strike": _num(m.get("floor_strike")),
+                        "volume_fp": _num(m.get("volume_fp")),
+                        "attempts": attempts_bump,
+                    },
+                )
+            except Exception as exc:
+                self.last_error = f"settle write {ticker}: {exc}"
+        self._last_settle = time.time()
 
     def _run(self):
         while not self._stop.is_set():
@@ -209,14 +287,14 @@ class Collector:
                 if started - self._last_discovery > DISCOVERY_SECONDS:
                     self._discover()
                 self._poll_once()
-            except Exception as exc:  # never let the thread die
+                if started - self._last_settle > SETTLE_EVERY:
+                    self._sweep_settlement()
+            except Exception as exc:
                 self.last_error = f"loop: {exc}"
                 log.exception("collector loop error")
             sleep_for = POLL_SECONDS - (time.time() - started)
             if sleep_for > 0:
                 self._stop.wait(sleep_for)
-
-    # ---- dashboard -----------------------------------------------------
 
     def status(self):
         stale = None
