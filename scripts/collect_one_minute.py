@@ -232,3 +232,18 @@ def main():
             samples = excluded.samples,
             gap_flag = excluded.gap_flag
         returning ticker, minute_ts, samples, yes_bid, no_bid, spread_close,
+                  yes_levels, no_levels, gap_flag;
+    """
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, row)
+                written = cur.fetchone()
+                print("db returned:", written)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
