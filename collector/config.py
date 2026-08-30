@@ -23,7 +23,7 @@ def _secret(name, default=None):
 
 # Ranked by how often a late favourite has room to rest inside the spread.
 # BTC is deliberately absent: 1c wide 96% of the time, nothing to rest inside.
-SERIES = ["KXDOGE15M", "KXXRP15M", "KXSILVER15M", "KXSOL15M", "KXGOLD15M"]
+SERIES = ["KXDOGE15M", "KXXRP15M", "KXSILVER15M", "KXSOL15M", "KXGOLD15M", "KXBTC15M"]
 
 POLL_SECONDS = 5           # book snapshot cadence
 DISCOVERY_SECONDS = 30     # how often to re-check which market is open
