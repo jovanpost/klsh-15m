@@ -1,16 +1,4 @@
-"""
-Kalshi REST client. READ ONLY — there is no order-placing code in this file
-and none should ever be added to this repo.
-
-Book shape, confirmed live:
-    GET /markets/{ticker}/orderbook
-    -> {"orderbook_fp": {"yes_dollars": [...], "no_dollars": [...]}}
-    each level is [price_string, size_string]
-    sorted LOW -> HIGH, so the BEST bid is the LAST element
-    sizes are fractional ("14.10"), prices are 4-decimal dollars ("0.0910")
-
-Both sides are BIDS. A YES bid at X is a NO ask at 1 - X.
-"""
+"""Kalshi REST. READ ONLY."""
 
 import base64
 import time
@@ -49,7 +37,7 @@ class Kalshi:
             "Accept": "application/json",
         }
 
-    def get(self, path, params=None, timeout=10):
+    def get(self, path, params=None, timeout=15):
         r = self.session.get(
             BASE_URL + path,
             headers=self._headers("GET", API_PREFIX + path),
@@ -59,8 +47,6 @@ class Kalshi:
         r.raise_for_status()
         return r.json()
 
-    # ---- endpoints -----------------------------------------------------
-
     def open_markets(self, series_ticker, limit=20):
         data = self.get(
             "/markets",
@@ -69,14 +55,15 @@ class Kalshi:
         return data.get("markets", []) or []
 
     def orderbook(self, ticker):
-        return self.get(f"/markets/{ticker}/orderbook")
+        # depth=0 means all levels
+        return self.get(f"/markets/{ticker}/orderbook", params={"depth": 0})
 
-
-# ---- parsing -----------------------------------------------------------
+    def market(self, ticker):
+        data = self.get(f"/markets/{ticker}")
+        return data.get("market") or data
 
 
 def _levels(raw):
-    """[[price_str, size_str], ...] -> [(Decimal price, Decimal size), ...]"""
     out = []
     for lvl in raw or []:
         try:
@@ -86,27 +73,27 @@ def _levels(raw):
     return out
 
 
-def parse_book(payload):
-    """
-    Returns a plain dict for one snapshot, or None if the book is unusable.
+def _book_json(levels):
+    """[[price, size], ...] numbers, best bid first."""
+    ranked = sorted(levels, key=lambda p: p[0], reverse=True)
+    return [[float(p), float(s)] for p, s in ranked]
 
-    Sorted low -> high, so best bid is the LAST element. If Kalshi ever
-    changes that ordering this would silently read the worst level, so we
-    take max() by price instead of trusting position.
-    """
+
+def parse_book(payload):
     inner = (payload or {}).get("orderbook_fp")
     if not isinstance(inner, dict):
         return None
 
     yes = _levels(inner.get("yes_dollars"))
     no = _levels(inner.get("no_dollars"))
-
     yes_best = max(yes, key=lambda p: p[0]) if yes else (None, None)
     no_best = max(no, key=lambda p: p[0]) if no else (None, None)
-
     spread = None
     if yes_best[0] is not None and no_best[0] is not None:
         spread = Decimal("1") - yes_best[0] - no_best[0]
+
+    # depth=0 is "all"; exactly 100 on a side is the old capped default
+    truncated = (len(yes) == 100) or (len(no) == 100)
 
     return {
         "yes_bid": yes_best[0],
@@ -118,4 +105,7 @@ def parse_book(payload):
         "yes_levels": len(yes),
         "no_levels": len(no),
         "spread": spread,
+        "yes_book": _book_json(yes),
+        "no_book": _book_json(no),
+        "book_truncated": truncated,
     }
