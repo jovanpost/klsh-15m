@@ -1,39 +1,50 @@
--- 15-minute markets depth logger — one table, one row per market-minute.
--- Create this by hand in the Supabase SQL editor before running anything.
+-- 15-minute markets depth logger — one row per market-minute.
+-- Revision 2: corrected after the live probe.
+--   * prices are DOLLAR decimals to 4 places (deci-cent ticks), not integer cents
+--   * sizes are FRACTIONAL contracts ("14.10"), not integers
+--   * the book lives under orderbook_fp, keys yes_dollars / no_dollars
+--   * each level is [price_string, size_string], sorted LOW -> HIGH,
+--     so the BEST bid is the LAST element of the array
 --
--- Naming note: Kalshi's book is BIDS ONLY on both sides. "yes" columns are
--- YES bids, "no" columns are NO bids. A YES bid at X is a NO ask at 100-X.
+-- Kalshi's book is BIDS ONLY on both sides. "yes_*" columns are YES bids,
+-- "no_*" columns are NO bids. A YES bid at X is a NO ask at 1 - X.
 -- Do not rename these to bid/ask.
+--
+-- Spread (dollars) = 1 - yes_bid - no_bid.
 
 create table if not exists depth_minute (
     id              bigserial primary key,
 
     -- identity
-    series          text        not null,          -- KXGOLD15M
+    series          text        not null,          -- KXDOGE15M
     ticker          text        not null,          -- full market ticker
     minute_ts       timestamptz not null,          -- start of the minute, UTC
-    minutes_left    integer,                       -- to market close; null if unknown
+    minutes_left    integer,                       -- to close_time; null if unknown
 
-    -- top of book, close of minute (cents)
-    yes_bid         integer,
-    yes_bid_size    integer,
-    no_bid          integer,
-    no_bid_size     integer,
+    -- top of book at close of minute (dollars / contracts)
+    yes_bid         numeric(6,4),
+    yes_bid_size    numeric(14,2),
+    no_bid          numeric(6,4),
+    no_bid_size     numeric(14,2),
 
-    -- total resting contracts across all levels, close of minute
-    yes_depth_total integer,
-    no_depth_total  integer,
+    -- total resting size across all levels, close of minute
+    yes_depth_total numeric(16,2),
+    no_depth_total  numeric(16,2),
 
-    -- spread in cents = 100 - yes_bid - no_bid
-    spread_close    integer,
-    spread_min      integer,
-    spread_max      integer,
+    -- how many price levels were resting (thin book vs deep book — H1)
+    yes_levels      integer,
+    no_levels       integer,
 
-    -- first and last sample of the minute (detect intra-minute drift)
-    yes_bid_first   integer,
-    no_bid_first    integer,
-    yes_bid_last    integer,
-    no_bid_last     integer,
+    -- spread within the minute, dollars
+    spread_close    numeric(6,4),
+    spread_min      numeric(6,4),
+    spread_max      numeric(6,4),
+
+    -- first and last sample of the minute (intra-minute drift)
+    yes_bid_first   numeric(6,4),
+    no_bid_first    numeric(6,4),
+    yes_bid_last    numeric(6,4),
+    no_bid_last     numeric(6,4),
 
     -- data quality
     samples         integer     not null,          -- expect 12 at 5s polling
