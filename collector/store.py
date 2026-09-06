@@ -172,3 +172,20 @@ def recent_rows(engine, limit=25):
 def total_rows(engine):
     with engine.connect() as conn:
         return conn.execute(text("select count(*) from depth_minute")).scalar()
+
+
+def settle_paper(engine):
+    """Fill paper_upcont.result from the settlements the existing sweep wrote.
+    Read-only against depth_settlement; writes only to paper_upcont."""
+    sql = text(
+        """
+        update paper_upcont p
+        set result = s.result, settled_at = s.fetched_at
+        from depth_settlement s
+        where s.ticker = p.ticker
+          and p.result is null
+          and s.result in ('yes', 'no')
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(sql)
