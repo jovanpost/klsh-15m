@@ -13,6 +13,12 @@ from .config import (
     POLL_SECONDS,
 )
 from .kalshi import Kalshi, parse_book
+from .paper import (
+    evaluate as paper_eval,
+    close_window as paper_close,
+    forget as paper_forget,
+    PAPER_SERIES,
+)
 from .store import (
     insert_minute,
     insert_sample,
@@ -191,6 +197,12 @@ class Collector:
             if close_dt is not None:
                 ml = int((close_dt - minute).total_seconds() // 60)
 
+            if series in PAPER_SERIES and ml is not None and ml <= 12:
+                try:
+                    paper_eval(self.engine, self.kalshi, series, ticker, snap, ml, close_dt)
+                except Exception:
+                    log.exception("paper eval failed for %s", ticker)
+
             bucket = self._buckets.get(ticker)
             if bucket is None:
                 bucket = Bucket(series, ticker, minute, close_dt)
@@ -226,6 +238,11 @@ class Collector:
 
         for ticker in [t for t in self._buckets if t not in live]:
             self._flush(ticker)
+            try:
+                paper_close(self.engine, ticker)
+            except Exception:
+                log.exception("paper close failed for %s", ticker)
+            paper_forget(ticker)
         self.last_poll_at = now
 
     def _sweep_settlement(self):
@@ -278,6 +295,11 @@ class Collector:
                 )
             except Exception as exc:
                 self.last_error = f"settle write {ticker}: {exc}"
+        try:
+            from .store import settle_paper
+            settle_paper(self.engine)
+        except Exception as exc:
+            self.last_error = f"settle paper: {exc}"
         self._last_settle = time.time()
 
     def _run(self):
