@@ -12,6 +12,7 @@ Read only. No orders, no controls, no Telegram.
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import text
 
 from collector.config import POLL_SECONDS, load_config
 from collector.runner import Collector
@@ -95,3 +96,50 @@ except Exception as exc:
 
 if status["last_error"]:
     st.caption(f"Last error: {status['last_error']}")
+
+st.subheader("paper up-continuation")
+st.caption("Paper only. Places no orders.")
+try:
+    with collector.engine.connect() as conn:
+        totals = conn.execute(
+            text(
+                "select count(*) filter (where qualified) as qualified, "
+                "       count(*) filter (where not qualified) as skipped, "
+                "       max(decision_ts) as last_decision, "
+                "       avg(slippage) filter (where qualified) as mean_slip "
+                "from paper_upcont"
+            )
+        ).fetchone()
+        settled = conn.execute(
+            text(
+                "select count(*) as n, "
+                "       avg(case when result = 'yes' then 1.0 else 0.0 end) as realized, "
+                "       avg(ask_observed) as avg_ask, "
+                "       avg(fee_modeled) as avg_fee "
+                "from paper_upcont "
+                "where qualified and result is not null"
+            )
+        ).fetchone()
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Qualifying rows", int(totals.qualified or 0))
+    p2.metric("Skip rows", int(totals.skipped or 0))
+    p3.metric("Last decision", str(totals.last_decision)[:19] if totals.last_decision else "never")
+    p4.metric(
+        "Mean slippage",
+        f"{float(totals.mean_slip):+.4f}" if totals.mean_slip is not None else "n/a",
+    )
+
+    n = int(settled.n or 0)
+    if n and settled.realized is not None and settled.avg_ask is not None:
+        realized = float(settled.realized)
+        avg_ask = float(settled.avg_ask)
+        fee = float(settled.avg_fee or 0.0)
+        q1, q2, q3 = st.columns(3)
+        q1.metric("Settled n", n)
+        q2.metric("Realized vs avg ask", f"{realized:.3f} / {avg_ask:.3f}")
+        q3.metric("Running edge after fee", f"{realized - avg_ask - fee:+.4f}")
+    else:
+        st.info("No settled paper trades yet.")
+except Exception as exc:
+    st.error(f"Paper table read failed: {exc}")
