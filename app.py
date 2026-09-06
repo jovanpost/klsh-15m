@@ -98,7 +98,33 @@ if status["last_error"]:
     st.caption(f"Last error: {status['last_error']}")
 
 st.subheader("paper up-continuation")
-st.caption("Paper only. Places no orders.")
+st.caption("Paper only. Places no orders. P&L below is illustrative: $1 notional per trade, modeled fee only, no live slippage applied to price.")
+
+PNL_SQL = """
+with trades as (
+    select
+        ticker, series, ask_observed, result,
+        case
+            when result = 'yes' then (1.0 / ask_observed) - 1.0 - 0.07 * (1 - ask_observed)
+            when result = 'no'  then -1.0 - 0.07 * (1 - ask_observed)
+            else null
+        end as pnl_dollars
+    from paper_upcont
+    where qualified
+)
+select
+    series,
+    count(*) filter (where result is not null) as settled,
+    count(*) filter (where result = 'yes') as wins,
+    count(*) filter (where result = 'no') as losses,
+    avg(ask_observed) filter (where result is not null) as avg_entry_price,
+    sum(pnl_dollars) as total_pnl_dollars,
+    avg(pnl_dollars) as avg_pnl_per_trade
+from trades
+group by grouping sets ((series), ())
+order by series nulls last
+"""
+
 try:
     with collector.engine.connect() as conn:
         totals = conn.execute(
@@ -110,16 +136,7 @@ try:
                 "from paper_upcont"
             )
         ).fetchone()
-        settled = conn.execute(
-            text(
-                "select count(*) as n, "
-                "       avg(case when result = 'yes' then 1.0 else 0.0 end) as realized, "
-                "       avg(ask_observed) as avg_ask, "
-                "       avg(fee_modeled) as avg_fee "
-                "from paper_upcont "
-                "where qualified and result is not null"
-            )
-        ).fetchone()
+        pnl_rows = [dict(r._mapping) for r in conn.execute(text(PNL_SQL))]
 
     p1, p2, p3, p4 = st.columns(4)
     p1.metric("Qualifying rows", int(totals.qualified or 0))
@@ -130,16 +147,51 @@ try:
         f"{float(totals.mean_slip):+.4f}" if totals.mean_slip is not None else "n/a",
     )
 
-    n = int(settled.n or 0)
-    if n and settled.realized is not None and settled.avg_ask is not None:
-        realized = float(settled.realized)
-        avg_ask = float(settled.avg_ask)
-        fee = float(settled.avg_fee or 0.0)
-        q1, q2, q3 = st.columns(3)
-        q1.metric("Settled n", n)
-        q2.metric("Realized vs avg ask", f"{realized:.3f} / {avg_ask:.3f}")
-        q3.metric("Running edge after fee", f"{realized - avg_ask - fee:+.4f}")
+    overall = next((r for r in pnl_rows if r["series"] is None), None)
+    per_series = [r for r in pnl_rows if r["series"] is not None]
+
+    if overall and overall["settled"]:
+        n = int(overall["settled"])
+        wins = int(overall["wins"] or 0)
+        losses = int(overall["losses"] or 0)
+        win_rate = 100.0 * wins / n if n else 0.0
+        avg_entry = float(overall["avg_entry_price"] or 0.0)
+        total_pnl = float(overall["total_pnl_dollars"] or 0.0)
+        avg_pnl_pct = 100.0 * float(overall["avg_pnl_per_trade"] or 0.0)
+
+        st.markdown("**Overall — $1 notional per trade**")
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Settled", n)
+        m2.metric("Wins / Losses", f"{wins} / {losses}")
+        m3.metric("Win rate", f"{win_rate:.1f}%")
+        m4.metric("Avg entry price", f"{avg_entry:.4f}")
+        m5.metric("Total P&L ($1/trade)", f"${total_pnl:+.2f}")
+        m6.metric("Avg return / trade", f"{avg_pnl_pct:+.2f}%")
+
+        st.markdown("**By series**")
+        table = []
+        for r in per_series:
+            n_s = int(r["settled"] or 0)
+            w_s = int(r["wins"] or 0)
+            l_s = int(r["losses"] or 0)
+            table.append(
+                {
+                    "series": r["series"],
+                    "settled": n_s,
+                    "wins": w_s,
+                    "losses": l_s,
+                    "win_rate_pct": round(100.0 * w_s / n_s, 1) if n_s else None,
+                    "avg_entry_price": round(float(r["avg_entry_price"]), 4) if r["avg_entry_price"] is not None else None,
+                    "total_pnl_$": round(float(r["total_pnl_dollars"]), 2) if r["total_pnl_dollars"] is not None else None,
+                    "avg_return_pct": round(100.0 * float(r["avg_pnl_per_trade"]), 2) if r["avg_pnl_per_trade"] is not None else None,
+                }
+            )
+        st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
+        st.caption(
+            "n is still far below the spec's minimum (600/series or 1,800 pooled, 3+ weeks). "
+            "Treat everything above as a progress check, not a result."
+        )
     else:
-        st.info("No settled paper trades yet.")
+        st.info("No settled qualifying trades yet.")
 except Exception as exc:
     st.error(f"Paper table read failed: {exc}")
