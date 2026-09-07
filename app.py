@@ -191,6 +191,47 @@ try:
             "n is still far below the spec's minimum (600/series or 1,800 pooled, 3+ weeks). "
             "Treat everything above as a progress check, not a result."
         )
+
+        # ---- copyable markdown report ----
+        report_lines = [
+            f"### paper_upcont — {str(totals.last_decision)[:19] if totals.last_decision else 'n/a'} UTC",
+            "",
+            f"- Qualifying rows: {int(totals.qualified or 0)}",
+            f"- Skip rows: {int(totals.skipped or 0)}",
+            f"- Mean slippage: {f'{float(totals.mean_slip):+.4f}' if totals.mean_slip is not None else 'n/a'}",
+            "",
+            "**Overall — $1 notional per trade**",
+            "",
+            f"- Settled: {n}",
+            f"- Wins / Losses: {wins} / {losses}",
+            f"- Win rate: {win_rate:.1f}%",
+            f"- Avg entry price: {avg_entry:.4f}",
+            f"- Total P&L ($1/trade): ${total_pnl:+.2f}",
+            f"- Avg return / trade: {avg_pnl_pct:+.2f}%",
+            "",
+            "**By series**",
+            "",
+            "| series | settled | wins | losses | win_rate_pct | avg_entry_price | total_pnl_$ | avg_return_pct |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for row in table:
+            wr = row["win_rate_pct"] if row["win_rate_pct"] is not None else ""
+            ap = row["avg_entry_price"] if row["avg_entry_price"] is not None else ""
+            tp = row["total_pnl_$"] if row["total_pnl_$"] is not None else ""
+            ar = row["avg_return_pct"] if row["avg_return_pct"] is not None else ""
+            report_lines.append(
+                f"| {row['series']} | {row['settled']} | {row['wins']} | {row['losses']} | "
+                f"{wr} | {ap} | {tp} | {ar} |"
+            )
+        report_lines += [
+            "",
+            "_n is still far below the spec's minimum (600/series or 1,800 pooled, 3+ weeks). "
+            "Progress check, not a result._",
+        ]
+        report_md = "\n".join(report_lines)
+
+        st.markdown("**Copy stats (markdown)** — hover the block, click the copy icon top-right")
+        st.code(report_md, language="markdown")
     else:
         st.info("No settled qualifying trades yet.")
 except Exception as exc:
