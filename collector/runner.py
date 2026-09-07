@@ -1,4 +1,6 @@
-"""Minute rows always. Full book on minutes 14 and 3. 5s touch samples at open."""
+"""Minute rows always. Full book on minutes 14 and 3 for all series, plus
+minutes 12-7 for the three paper series (KXBTC15M/KXXRP15M/KXDOGE15M) so the
+decision window has book depth on record. 5s touch samples at open."""
 
 import logging
 import threading
@@ -18,6 +20,8 @@ from .paper import (
     close_window as paper_close,
     forget as paper_forget,
     PAPER_SERIES,
+    MIN_ML as PAPER_MIN_ML,
+    MAX_ML as PAPER_MAX_ML,
 )
 from .store import (
     insert_minute,
@@ -78,7 +82,11 @@ class Bucket:
         first, last = self.samples[0], self.samples[-1]
         spreads = [s["spread"] for s in self.samples if s["spread"] is not None]
         ml = self.minutes_left()
-        keep_book = ml in BOOK_MINUTES
+        keep_book = ml in BOOK_MINUTES or (
+            self.series in PAPER_SERIES
+            and ml is not None
+            and PAPER_MIN_ML <= ml <= PAPER_MAX_ML
+        )
         n = len(self.samples)
         return {
             "series": self.series,
