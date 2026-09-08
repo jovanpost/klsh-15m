@@ -189,3 +189,31 @@ def settle_paper(engine):
     )
     with engine.begin() as conn:
         conn.execute(sql)
+
+
+INSERT_BOOK_SAMPLE = text(
+    """
+    insert into depth_book_sample (
+        series, ticker, sample_ts, minutes_left,
+        yes_bid, no_bid, spread,
+        yes_depth_total, no_depth_total,
+        yes_book, no_book, book_truncated
+    ) values (
+        :series, :ticker, :sample_ts, :minutes_left,
+        :yes_bid, :no_bid, :spread,
+        :yes_depth_total, :no_depth_total,
+        CAST(:yes_book AS jsonb), CAST(:no_book AS jsonb), :book_truncated
+    )
+    on conflict (ticker, minutes_left) do nothing
+    """
+)
+
+
+def insert_book_sample(engine, row):
+    """Independent of insert_minute. Never touches depth_minute or any
+    other table. Used for the full-window book-sampling feature only."""
+    payload = dict(row)
+    payload["yes_book"] = _json(payload.get("yes_book"))
+    payload["no_book"] = _json(payload.get("no_book"))
+    with engine.begin() as conn:
+        conn.execute(INSERT_BOOK_SAMPLE, payload)
