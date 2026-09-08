@@ -24,6 +24,7 @@ from .paper import (
     MAX_ML as PAPER_MAX_ML,
 )
 from .store import (
+    insert_book_sample,
     insert_minute,
     insert_sample,
     make_engine,
@@ -36,6 +37,13 @@ log = logging.getLogger("collector")
 BOOK_MINUTES = {14, 3}
 SAMPLE_MIN_LEFT = 14
 SETTLE_EVERY = 1800
+
+# Full-window book sampling, all series (separate from the paper-strategy
+# edge/decision-band book capture above, and from depth_minute/depth_sample).
+# 1 in N minute-flushes per ticker gets a full order-book snapshot recorded
+# to depth_book_sample. Deterministic counter, not random, so coverage is
+# even across the window rather than clustering by chance.
+BOOK_SAMPLE_EVERY = 5
 
 
 def _minute_floor(dt):
@@ -134,6 +142,7 @@ class Collector:
         self.active = {}
         self._buckets = {}
         self._close_times = {}
+        self._book_sample_counter = {}
         self._last_discovery = 0.0
         self._last_settle = 0.0
 
@@ -183,6 +192,33 @@ class Collector:
             self.last_write_at = datetime.now(timezone.utc)
         except Exception as exc:
             self.last_error = f"write {ticker}: {exc}"
+
+        # Full-window book sampling (all series). Independent of the write
+        # above: a failure here never touches depth_minute or rows_written.
+        count = self._book_sample_counter.get(ticker, 0) + 1
+        self._book_sample_counter[ticker] = count
+        if count % BOOK_SAMPLE_EVERY == 0 and bucket.samples:
+            last = bucket.samples[-1]
+            try:
+                insert_book_sample(
+                    self.engine,
+                    {
+                        "series": bucket.series,
+                        "ticker": ticker,
+                        "sample_ts": last.get("ts"),
+                        "minutes_left": row["minutes_left"],
+                        "yes_bid": last.get("yes_bid"),
+                        "no_bid": last.get("no_bid"),
+                        "spread": last.get("spread"),
+                        "yes_depth_total": last.get("yes_depth_total"),
+                        "no_depth_total": last.get("no_depth_total"),
+                        "yes_book": last.get("yes_book"),
+                        "no_book": last.get("no_book"),
+                        "book_truncated": last.get("book_truncated"),
+                    },
+                )
+            except Exception as exc:
+                log.exception("book sample failed for %s: %s", ticker, exc)
 
     def _poll_once(self):
         now = datetime.now(timezone.utc)
@@ -251,6 +287,7 @@ class Collector:
             except Exception:
                 log.exception("paper close failed for %s", ticker)
             paper_forget(ticker)
+            self._book_sample_counter.pop(ticker, None)
         self.last_poll_at = now
 
     def _sweep_settlement(self):
